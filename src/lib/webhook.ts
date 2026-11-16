@@ -1,3 +1,4 @@
+import { safeRequest } from "./security";
 import { prisma } from "./prisma";
 import crypto from "crypto";
 import { normalizeMessageContent, downloadMediaMessage, WAMessage } from "@whiskeysockets/baileys";
@@ -156,12 +157,11 @@ async function sendWebhookRequest(url: string, payload: WebhookPayload, secret?:
     let errorMessage: string | undefined;
 
     try {
-        response = await fetch(url, {
+        response = await safeRequest(url, {
             method: "POST",
             headers,
             body,
-            signal: AbortSignal.timeout(10000) // 10 second timeout
-        });
+        }, { allowHttp: true, timeoutMs: 10000, maxBytes: 1024 * 1024 });
 
         responseBody = await response.text().catch(() => undefined);
         if (responseBody && responseBody.length > 1024) {
@@ -298,17 +298,11 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
     }
 
     try {
-        const { validateSafeUrl } = await import("./security");
-        const safeCheck = await validateSafeUrl(url, { allowHttp: false });
-        if (!safeCheck.valid) throw new Error(`SSRF Blocked: ${safeCheck.error}`);
-
-        const response = await fetch(url, {
+        const response = await safeRequest(url, {
             method: "POST",
             headers,
             body,
-            redirect: "manual",
-            signal: AbortSignal.timeout(15000)
-        });
+        }, { timeoutMs: 15000, maxBytes: 1024 * 1024 });
 
         const responseTimeMs = Date.now() - startedAt;
         const responseSize = Number(response.headers.get("content-length")) || 0;

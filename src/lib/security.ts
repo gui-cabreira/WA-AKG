@@ -1,11 +1,23 @@
 import dns from "dns";
 import net from "net";
-import { logger } from "./logger";
+import http from "node:http";
+import https from "node:https";
 
 /**
  * Checks if an IPv4 or IPv6 address is private, loopback, link-local, or reserved.
  */
 export function isPrivateOrReservedIp(ip: string): boolean {
+    // Canonicalize IPv6 first, including expanded IPv4-mapped spellings.
+    if (net.isIPv6(ip)) {
+        ip = new URL(`http://[${ip}]/`).hostname.slice(1, -1).toLowerCase();
+        if (ip.startsWith("::ffff:")) {
+            const words = ip.slice(7).split(":");
+            if (words.length === 2) {
+                const hi = parseInt(words[0], 16), lo = parseInt(words[1], 16);
+                ip = `${hi >>> 8}.${hi & 255}.${lo >>> 8}.${lo & 255}`;
+            }
+        }
+    }
     // Handle IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
     if (ip.startsWith("::ffff:")) {
         ip = ip.substring(7);
@@ -59,6 +71,7 @@ export function isPrivateOrReservedIp(ip: string): boolean {
         if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
         // :: (Unspecified)
         if (lower === "::" || lower === "0:0:0:0:0:0:0:0") return true;
+        if (lower.startsWith("ff") || lower.startsWith("fec") || lower.startsWith("fed") || lower.startsWith("fee") || lower.startsWith("fef")) return true;
         // fe80::/10 (Link-local)
         if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) return true;
         // fc00::/7 (Unique local private - fc00::/7 or fd00::/8)
@@ -105,7 +118,8 @@ export async function validateSafeUrl(
         return { valid: false, error: `Protocol '${parsed.protocol}' is not allowed. Only HTTPS is supported.` };
     }
 
-    const hostname = parsed.hostname;
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+    if (parsed.username || parsed.password) return { valid: false, error: "URL credentials are forbidden" };
     if (!hostname) {
         return { valid: false, error: "URL missing valid hostname" };
     }
@@ -166,98 +180,78 @@ const DEFAULT_TIMEOUT_MS = 10000; // 10s
 /**
  * Safely fetches a remote file with SSRF protection, size limits, and timeout.
  */
-export async function safeFetchBuffer(
-    urlStr: string,
-    options: SafeFetchOptions = {}
-): Promise<{ buffer: Buffer; contentType: string; fileName?: string }> {
-    const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+/** Buffered request with DNS pinned to an already validated address and a total deadline. */
+export async function safeRequest(urlStr: string, init: {
+    method?: string; headers?: Record<string, string>; body?: string;
+} = {}, options: SafeFetchOptions = {}): Promise<Response> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-
-    let currentUrl = urlStr;
-    const maxRedirects = 3;
-
-    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
-        const val = await validateSafeUrl(currentUrl, {
-            allowHttp: options.allowHttp,
-            allowedHostnames: options.allowedHostnames
-        });
-
-        if (!val.valid || !val.url) {
-            throw new Error(`SSRF Prevention: ${val.error}`);
-        }
-
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-        let response: Response;
-        try {
-            response = await fetch(val.url.toString(), {
-                method: "GET",
-                signal: controller.signal,
-                redirect: "manual" // Handle redirects manually to validate destination IP at each hop
+    const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    return new Promise((resolve, reject) => {
+        let request: http.ClientRequest | undefined;
+        let settled = false;
+        const timer = setTimeout(() => {
+            settled = true;
+            request?.destroy();
+            reject(new Error("Remote request deadline exceeded"));
+        }, timeoutMs);
+        const fail = (err: Error) => { if (!settled) { settled = true; clearTimeout(timer); reject(err); } };
+        void validateSafeUrl(urlStr, options).then(val => {
+            if (settled) return;
+            if (!val.valid || !val.url || !val.resolvedIps?.length) throw new Error(`SSRF Prevention: ${val.error}`);
+            const pinned = val.resolvedIps[0];
+            const transport = val.url.protocol === "https:" ? https : http;
+            request = transport.request(val.url, {
+                method: init.method ?? "GET", headers: init.headers, agent: false,
+                lookup: (_hostname, opts, callback) => {
+                    const entry = { address: pinned, family: net.isIP(pinned) };
+                    if (typeof opts === "object" && opts.all) callback(null, [entry]);
+                    else callback(null, pinned, entry.family);
+                },
+            }, response => {
+                const chunks: Buffer[] = [];
+                let size = 0;
+                response.on("data", (chunk: Buffer) => {
+                    size += chunk.length;
+                    if (size > maxBytes) {
+                        response.destroy(); request?.destroy(); fail(new Error("Remote body exceeds size limit"));
+                    } else chunks.push(chunk);
+                });
+                response.on("error", fail);
+                response.on("aborted", () => fail(new Error("Remote body aborted")));
+                response.on("end", () => {
+                    if (settled) return;
+                    settled = true; clearTimeout(timer);
+                    const headers = new Headers();
+                    for (const [key, value] of Object.entries(response.headers)) {
+                        if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+                    }
+                    const status = response.statusCode ?? 502;
+                    resolve(new Response([204,205,304].includes(status) ? null : new Uint8Array(Buffer.concat(chunks)), { status, headers }));
+                });
             });
-        } catch (err: any) {
-            clearTimeout(timer);
-            throw new Error(`Network fetch failed for '${currentUrl}': ${err.message}`);
-        } finally {
-            clearTimeout(timer);
-        }
+            request.on("error", fail);
+            request.end(init.body);
+        }).catch(fail);
+    });
+}
 
-        // Handle redirects
+export async function safeFetchBuffer(urlStr: string, options: SafeFetchOptions = {}): Promise<{ buffer: Buffer; contentType: string; fileName?: string }> {
+    let currentUrl = urlStr;
+    const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    for (let redirects = 0; redirects <= 3; redirects++) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("Remote request deadline exceeded");
+        const response = await safeRequest(currentUrl, {}, { ...options, timeoutMs: remaining });
         if (response.status >= 300 && response.status < 400) {
             const location = response.headers.get("location");
-            if (!location) {
-                throw new Error(`Redirect response (${response.status}) missing Location header`);
-            }
-            // Resolve relative redirect
-            currentUrl = new URL(location, val.url).toString();
+            if (!location) throw new Error("Redirect without location");
+            currentUrl = new URL(location, currentUrl).toString();
             continue;
         }
-
-        if (!response.ok) {
-            throw new Error(`Remote server responded with HTTP ${response.status} ${response.statusText}`);
-        }
-
-        // Check Content-Length header if present
-        const contentLength = response.headers.get("content-length");
-        if (contentLength && parseInt(contentLength, 10) > maxBytes) {
-            throw new Error(`File size (${contentLength} bytes) exceeds the maximum limit of ${maxBytes} bytes`);
-        }
-
-        // Stream body with byte counter
-        if (!response.body) {
-            throw new Error("Empty response body from remote server");
-        }
-
-        const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let receivedBytes = 0;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-                receivedBytes += value.length;
-                if (receivedBytes > maxBytes) {
-                    reader.cancel();
-                    throw new Error(`Download exceeded maximum permitted size of ${maxBytes} bytes`);
-                }
-                chunks.push(value);
-            }
-        }
-
-        const buffer = Buffer.concat(chunks);
-        const contentType = response.headers.get("content-type") || "application/octet-stream";
-        const pathFileName = val.url.pathname.split("/").pop() || "media";
-
-        return {
-            buffer,
-            contentType,
-            fileName: pathFileName
-        };
+        if (!response.ok) throw new Error(`Remote server HTTP ${response.status}`);
+        return { buffer: Buffer.from(await response.arrayBuffer()), contentType: response.headers.get("content-type") || "application/octet-stream", fileName: new URL(currentUrl).pathname.split("/").pop() || "media" };
     }
-
-    throw new Error(`Too many redirects (max ${maxRedirects})`);
+    throw new Error("Too many redirects");
 }
 
 /**

@@ -151,7 +151,8 @@ export async function POST(
         };
 
         // Process message payload (same as /send)
-        let msgPayload = message;
+        const { materializeSafeMediaPayload } = await import("@/lib/security");
+        const msgPayload = await materializeSafeMediaPayload(message);
 
         if (msgPayload.text && mentions && Array.isArray(mentions)) {
             msgPayload.mentions = mentions;
