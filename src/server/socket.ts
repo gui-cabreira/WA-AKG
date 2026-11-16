@@ -99,10 +99,9 @@ export function setupSocket(io: Server) {
             }
 
             // 2. Try API Key from auth payload or x-api-key header
-            const apiKey = 
+            const apiKey =
                 (socket.handshake.auth?.apiKey as string) ||
-                (headers["x-api-key"] as string) ||
-                (undefined as unknown as string);
+                (headers["x-api-key"] as string);
 
             if (apiKey && typeof apiKey === "string") {
                 const user = await prisma.user.findUnique({
