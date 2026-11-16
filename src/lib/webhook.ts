@@ -298,18 +298,21 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
     }
 
     try {
+        const { validateSafeUrl } = await import("./security");
+        const safeCheck = await validateSafeUrl(url, { allowHttp: false });
+        if (!safeCheck.valid) throw new Error(`SSRF Blocked: ${safeCheck.error}`);
+
         const response = await fetch(url, {
             method: "POST",
             headers,
             body,
+            redirect: "manual",
             signal: AbortSignal.timeout(15000)
         });
 
         const responseTimeMs = Date.now() - startedAt;
-        let responseBody = await response.text().catch(() => undefined);
-        if (responseBody && responseBody.length > 1024) {
-            responseBody = responseBody.substring(0, 1024);
-        }
+        const responseSize = Number(response.headers.get("content-length")) || 0;
+        const safeSummary = `HTTP ${response.status} ${response.statusText}${responseSize ? ` (${responseSize} bytes)` : ""}`;
 
         // Record test log
         await recordWebhookLog({
@@ -320,7 +323,7 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
             requestHeaders: headers,
             requestBody: testPayload,
             responseStatusCode: response.status,
-            responseBody: responseBody || null,
+            responseBody: safeSummary,
             responseTimeMs,
             errorMessage: response.ok ? null : `Webhook returned ${response.status}: ${response.statusText}`
         });
@@ -329,7 +332,6 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
             return {
                 success: false,
                 statusCode: response.status,
-                responseBody,
                 responseTimeMs,
                 error: `Returned ${response.status}: ${response.statusText}`
             };
