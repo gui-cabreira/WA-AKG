@@ -334,7 +334,7 @@ export async function testWebhook(webhookId: string, url: string, secret?: strin
         return {
             success: true,
             statusCode: response.status,
-            responseBody,
+            responseBody: safeSummary,
             responseTimeMs
         };
     } catch (err: any) {
