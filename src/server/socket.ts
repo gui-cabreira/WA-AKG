@@ -58,13 +58,15 @@ export function setupSocket(io: Server) {
                                 salt
                             });
 
-                            if (decoded && decoded.id) {
-                                socket.data.user = {
-                                    id: decoded.id as string,
-                                    role: (decoded.role as string) || "USER",
-                                    email: (decoded.email as string) || ""
-                                };
-                                return next();
+                            if (decoded && typeof decoded.id === "string") {
+                                const currentUser = await prisma.user.findUnique({
+                                    where: { id: decoded.id },
+                                    select: { id: true, role: true, email: true }
+                                });
+                                if (currentUser) {
+                                    socket.data.user = currentUser;
+                                    return next();
+                                }
                             }
                         } catch {
                             // continue trying salts
@@ -74,7 +76,9 @@ export function setupSocket(io: Server) {
 
                 // Check cookies
                 for (const cookieName of tokenCookieNames) {
-                    const tokenVal = cookies[cookieName];
+                    const chunks = Object.keys(cookies).filter(key => key.startsWith(`${cookieName}.`) && /^\d+$/.test(key.slice(cookieName.length + 1)))
+                        .sort((a, b) => Number(a.slice(cookieName.length + 1)) - Number(b.slice(cookieName.length + 1)));
+                    const tokenVal = cookies[cookieName] || chunks.map(key => cookies[key]).join("");
                     if (tokenVal) {
                         try {
                             const decoded = await decodeJwt({
@@ -83,13 +87,15 @@ export function setupSocket(io: Server) {
                                 salt: cookieName
                             });
 
-                            if (decoded && decoded.id) {
-                                socket.data.user = {
-                                    id: decoded.id as string,
-                                    role: (decoded.role as string) || "USER",
-                                    email: (decoded.email as string) || ""
-                                };
-                                return next();
+                            if (decoded && typeof decoded.id === "string") {
+                                const currentUser = await prisma.user.findUnique({
+                                    where: { id: decoded.id },
+                                    select: { id: true, role: true, email: true }
+                                });
+                                if (currentUser) {
+                                    socket.data.user = currentUser;
+                                    return next();
+                                }
                             }
                         } catch (e) {
                             logger.debug("Socket", `Failed decoding cookie ${cookieName}:`, e);
@@ -151,9 +157,11 @@ export function setupSocket(io: Server) {
                     return;
                 }
 
+                const currentUser = await prisma.user.findUnique({ where: { id: socket.data.user.id }, select: { id: true, role: true, email: true } });
+                if (!currentUser) { socket.emit("error", { message: "Unauthorized" }); return; }
                 const canAccess = await canAccessSession(
-                    socket.data.user.id,
-                    socket.data.user.role,
+                    currentUser.id,
+                    currentUser.role,
                     sessionId
                 );
 
@@ -172,7 +180,8 @@ export function setupSocket(io: Server) {
         });
 
         // 🛡️ Authorized User-specific Notification Room Join
-        socket.on("join-user-room", (userId: string) => {
+        socket.on("join-user-room", async (userId: string) => {
+            try {
             if (!userId || typeof userId !== "string") {
                 socket.emit("error", { message: "Invalid userId" });
                 return;
@@ -183,8 +192,10 @@ export function setupSocket(io: Server) {
                 return;
             }
 
-            // Only allow joining own user room, unless SUPERADMIN
-            if (socket.data.user.id !== userId && socket.data.user.role !== "SUPERADMIN") {
+            const currentUser = await prisma.user.findUnique({ where: { id: socket.data.user.id }, select: { id: true, role: true, email: true } });
+            if (!currentUser) { socket.emit("error", { message: "Unauthorized" }); return; }
+            // Only allow joining own user room, unless current database role is SUPERADMIN.
+            if (currentUser.id !== userId && currentUser.role !== "SUPERADMIN") {
                 logger.warn("Socket", `Forbidden join-user-room attempt: User ${socket.data.user.id} tried to join user:${userId}`);
                 socket.emit("error", { message: "Forbidden - Cannot access other user room" });
                 return;
@@ -192,6 +203,10 @@ export function setupSocket(io: Server) {
 
             socket.join(`user:${userId}`);
             logger.debug("Socket", `Socket ${socket.id} joined user room: user:${userId}`);
+            } catch (err) {
+                logger.error("Socket", "Error checking user room access:", err);
+                socket.emit("error", { message: "Error joining user room" });
+            }
         });
     });
 }

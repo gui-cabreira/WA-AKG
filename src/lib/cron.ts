@@ -1,3 +1,4 @@
+import { materializeSafeMediaPayload } from "@/lib/security";
 import cron from "node-cron";
 import cronParser from "cron-parser";
 import { prisma } from "@/lib/prisma";
@@ -58,7 +59,7 @@ export function initScheduler() {
                             payload.mimetype = "application/octet-stream";
                             payload.fileName = msg.mediaUrl.split('/').pop() || "file";
                         }
-                        await instance.socket.sendMessage(msg.jid, payload);
+                        await instance.socket.sendMessage(msg.jid, await materializeSafeMediaPayload(payload));
                     } else {
                         await instance.socket.sendMessage(msg.jid, { text: msg.content || "" });
                     }

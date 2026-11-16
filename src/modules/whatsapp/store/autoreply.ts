@@ -1,3 +1,4 @@
+import { materializeSafeMediaPayload } from "@/lib/security";
 import { prisma } from "@/lib/prisma";
 import type { WASocket } from "@whiskeysockets/baileys";
 import { normalizeMessageContent } from "@whiskeysockets/baileys";
@@ -170,7 +171,7 @@ export async function bindAutoReply(sock: WASocket, sessionId: string) {
                             }
                             
                             try {
-                                await sock.sendMessage(remoteJid, payload, { quoted: msg });
+                                await sock.sendMessage(remoteJid, await materializeSafeMediaPayload(payload), { quoted: msg });
                             } catch (err: any) {
                                 logger.error("AutoReply", `Failed to send media auto-reply from URL: ${err.message}. Falling back to text if response exists.`);
                                 if (rule.response) {

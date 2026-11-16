@@ -220,13 +220,16 @@ export async function safeRequest(urlStr: string, init: {
                 response.on("aborted", () => fail(new Error("Remote body aborted")));
                 response.on("end", () => {
                     if (settled) return;
-                    settled = true; clearTimeout(timer);
+                    try {
                     const headers = new Headers();
                     for (const [key, value] of Object.entries(response.headers)) {
                         if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(", ") : value);
                     }
                     const status = response.statusCode ?? 502;
-                    resolve(new Response([204,205,304].includes(status) ? null : new Uint8Array(Buffer.concat(chunks)), { status, headers }));
+                    if (status < 200 || status > 599) throw new Error(`Unsupported remote HTTP status ${status}`);
+                    const result = new Response([204,205,304].includes(status) ? null : new Uint8Array(Buffer.concat(chunks)), { status, headers });
+                    settled = true; clearTimeout(timer); resolve(result);
+                    } catch (err) { fail(err instanceof Error ? err : new Error("Invalid remote response")); }
                 });
             });
             request.on("error", fail);
