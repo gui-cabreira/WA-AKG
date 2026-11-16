@@ -1,13 +1,13 @@
 # Security verification, 2026-11-16
 
-Synthetic regression tests use Node 24's TypeScript erasure and mocks; they never access production, DNS, WhatsApp or patient/client data.
+Tests: `node scripts/tests/security-regression.mjs` and `node scripts/tests/socket-regression.mjs` (Node 24 TypeScript erasure, mocked network/DB/timers, no production or real WhatsApp messages).
 
-Run `node scripts/tests/security-regression.mjs` and `node scripts/tests/socket-regression.mjs`.
+Passed: DNS pinning, private IP variants, body deadline, byte limit, local path rejection, invalid HTTP status, background-media guard wiring; anonymous rejection, foreign room rejection, chunked JWT, stale role, deleted user, already-joined shared-room revocation, API-key rotation, demotion, JWT expiry, DB failure/hang, lease expiry and timer cleanup.
 
-Verified: private IP variants, connection DNS pinning, body-read deadline, byte limit, media local-path rejection, URL credential rejection, anonymous socket rejection, own versus other tenant/session rooms through mocked authorization.
+Socket authorization refreshes every 5 seconds. Checks have a 5-second deadline; existing authorization expires after at most 15 seconds without renewal. Revocation is bounded rather than instantaneous and depends on normal event-loop scheduling. A failed or timed-out check disconnects the socket. Tests use fake timers, not real deployment load.
 
-Not verified: live NextAuth cookies and chunked cookies, database-backed authorization, actual WhatsApp payload delivery, deployed revision. `npm ci --ignore-scripts` fails on the preexisting lockfile mismatch (openapi-types, tree-sitter and tree-sitter-json). An isolated npm install (without changing the lockfile), existing patch-package, Prisma generation, typecheck and Next.js build completed. CI reproducibility via npm ci remains blocked. These mocks are not end-to-end tests.
+Prisma generation, complete TypeScript check and Next.js production build passed. Core `security.ts` and `socket.ts` lint passed. Full repository lint still reports 319 errors and 178 warnings and is NOT green. Avoid disabling lint rules to hide these.
 
-Compatibility: private/internal HTTP webhook destinations and redirects are now rejected. Existing deployments relying on private webhook endpoints need a separately reviewed explicit destination design, not a blanket SSRF bypass. Media downloads use an independently pinned HTTP request and do not forward caller credentials.
+The preexisting npm lock mismatch was repaired (peer dependency placement including tree-sitter/openapi-types), preserving platform libc metadata. A fresh isolated `npm ci --ignore-scripts` passed. Existing patch-package was separately applied before the build. Package lifecycle scripts are not generally executed by that clean-install check.
 
-Additional checks: HTTP status 600 safely rejected; background media guard wiring checked; current DB role used rather than stale JWT role. JWT chunks reassembled. Existing already-joined socket rooms are not immediately evicted when access is revoked; this remains a lifecycle limitation requiring explicit design.
+Not verified: real identity-provider cookies, DB-backed end-to-end isolation, live WhatsApp delivery, cloud CI, active deployment or retroactive exposure. Private/internal webhook destinations and redirects are rejected; deployments relying on private endpoints need an explicit reviewed destination design, not blanket SSRF bypass.

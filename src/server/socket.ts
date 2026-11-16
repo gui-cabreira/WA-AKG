@@ -36,7 +36,7 @@ export function setupSocket(io: Server) {
 
             const secret = process.env.AUTH_SECRET;
 
-            let decodeJwt: any = null;
+            let decodeJwt: typeof import("next-auth/jwt").decode | null = null;
             try {
                 const jwtMod = await import("next-auth/jwt");
                 decodeJwt = jwtMod.decode;
@@ -58,13 +58,15 @@ export function setupSocket(io: Server) {
                                 salt
                             });
 
-                            if (decoded && typeof decoded.id === "string") {
+                            if (decoded && typeof decoded.id === "string" && typeof decoded.exp === "number" && decoded.exp * 1000 > Date.now()) {
                                 const currentUser = await prisma.user.findUnique({
                                     where: { id: decoded.id },
                                     select: { id: true, role: true, email: true }
                                 });
                                 if (currentUser) {
                                     socket.data.user = currentUser;
+                                    socket.data.authKind = "jwt";
+                                    socket.data.expiresAt = decoded.exp * 1000;
                                     return next();
                                 }
                             }
@@ -87,13 +89,15 @@ export function setupSocket(io: Server) {
                                 salt: cookieName
                             });
 
-                            if (decoded && typeof decoded.id === "string") {
+                            if (decoded && typeof decoded.id === "string" && typeof decoded.exp === "number" && decoded.exp * 1000 > Date.now()) {
                                 const currentUser = await prisma.user.findUnique({
                                     where: { id: decoded.id },
                                     select: { id: true, role: true, email: true }
                                 });
                                 if (currentUser) {
                                     socket.data.user = currentUser;
+                                    socket.data.authKind = "jwt";
+                                    socket.data.expiresAt = decoded.exp * 1000;
                                     return next();
                                 }
                             }
@@ -116,6 +120,7 @@ export function setupSocket(io: Server) {
                 });
 
                 if (user) {
+                    socket.data.authKind = "api-key";
                     socket.data.user = {
                         id: user.id,
                         role: user.role,
@@ -140,7 +145,62 @@ export function setupSocket(io: Server) {
         const user = socket.data.user;
         logger.info("Socket", `Client connected: ${socket.id} (User: ${user?.id || "unknown"}, Role: ${user?.role || "unknown"})`);
 
+        // Short leases bound already-joined room access after role/key/share revocation.
+        // Never keep existing rooms indefinitely while a DB check is hung/unavailable.
+        const sessionRooms = new Set<string>();
+        const userRooms = new Set<string>();
+        let leaseTimer: ReturnType<typeof setTimeout>;
+        let refreshInFlight: Promise<boolean> | undefined;
+        const revoke = () => { socket.disconnect(true); };
+        const renewLease = () => {
+            clearTimeout(leaseTimer);
+            const remaining = socket.data.authKind === "jwt" ? socket.data.expiresAt - Date.now() : 15000;
+            leaseTimer = setTimeout(revoke, Math.max(0, Math.min(15000, remaining)));
+            leaseTimer.unref?.();
+        };
+        const refresh = (): Promise<boolean> => {
+            if (refreshInFlight) return refreshInFlight;
+            refreshInFlight = (async () => {
+                let deadline: ReturnType<typeof setTimeout> | undefined;
+                try {
+                    const check = async () => {
+                        if (socket.data.authKind === "jwt" && socket.data.expiresAt <= Date.now()) return false;
+                        const apiKey = socket.handshake.auth?.apiKey || socket.handshake.headers["x-api-key"];
+                        const where = socket.data.authKind === "api-key" ? { apiKey: String(apiKey) } : { id: user.id };
+                        const current = await prisma.user.findUnique({ where, select: { id: true, role: true, email: true } });
+                        if (!current || current.id !== user.id) return false;
+                        for (const room of sessionRooms) {
+                            if (!await canAccessSession(current.id, current.role, room)) {
+                                await socket.leave(room); sessionRooms.delete(room);
+                            }
+                        }
+                        for (const room of userRooms) {
+                            if (room !== current.id && current.role !== "SUPERADMIN") {
+                                await socket.leave(`user:${room}`); userRooms.delete(room);
+                            }
+                        }
+                        socket.data.user = current;
+                        return true;
+                    };
+                    const allowed = await Promise.race([
+                        check(),
+                        new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), 5000); deadline.unref?.(); })
+                    ]);
+                    if (!allowed) { revoke(); return false; }
+                    if (socket.connected) renewLease();
+                    return allowed && socket.connected;
+                } catch (err) {
+                    logger.error("Socket", "Access refresh failed", err); revoke(); return false;
+                } finally { clearTimeout(deadline); refreshInFlight = undefined; }
+            })();
+            return refreshInFlight;
+        };
+        renewLease();
+        const refreshTimer = setInterval(() => { void refresh(); }, 5000);
+        refreshTimer.unref?.();
         socket.on("disconnect", () => {
+            clearTimeout(leaseTimer); clearInterval(refreshTimer);
+            sessionRooms.clear(); userRooms.clear();
             logger.info("Socket", `Client disconnected: ${socket.id}`);
         });
 
@@ -157,7 +217,8 @@ export function setupSocket(io: Server) {
                     return;
                 }
 
-                const currentUser = await prisma.user.findUnique({ where: { id: socket.data.user.id }, select: { id: true, role: true, email: true } });
+                if (!await refresh()) return;
+                const currentUser = socket.data.user;
                 if (!currentUser) { socket.emit("error", { message: "Unauthorized" }); return; }
                 const canAccess = await canAccessSession(
                     currentUser.id,
@@ -171,7 +232,9 @@ export function setupSocket(io: Server) {
                     return;
                 }
 
-                socket.join(sessionId);
+                if (!socket.connected) return;
+                await socket.join(sessionId);
+                sessionRooms.add(sessionId);
                 logger.debug("Socket", `Socket ${socket.id} (User: ${socket.data.user.id}) joined session room: ${sessionId}`);
             } catch (err) {
                 logger.error("Socket", `Error joining session ${sessionId}:`, err);
@@ -192,7 +255,8 @@ export function setupSocket(io: Server) {
                 return;
             }
 
-            const currentUser = await prisma.user.findUnique({ where: { id: socket.data.user.id }, select: { id: true, role: true, email: true } });
+            if (!await refresh()) return;
+            const currentUser = socket.data.user;
             if (!currentUser) { socket.emit("error", { message: "Unauthorized" }); return; }
             // Only allow joining own user room, unless current database role is SUPERADMIN.
             if (currentUser.id !== userId && currentUser.role !== "SUPERADMIN") {
@@ -201,7 +265,9 @@ export function setupSocket(io: Server) {
                 return;
             }
 
-            socket.join(`user:${userId}`);
+            if (!socket.connected) return;
+            await socket.join(`user:${userId}`);
+            userRooms.add(userId);
             logger.debug("Socket", `Socket ${socket.id} joined user room: user:${userId}`);
             } catch (err) {
                 logger.error("Socket", "Error checking user room access:", err);
