@@ -39,11 +39,17 @@ app.prepare().then(() => {
     }
   });
 
+  const allowedOrigin = process.env.BASE_URL || `http://${hostname}:${port}`;
+  const customCorsOrigins = (process.env.CORS_ORIGIN || "").split(",").map(origin => origin.trim()).filter(Boolean);
+  const allowedOrigins = new Set([allowedOrigin, process.env.NEXTAUTH_URL, "http://localhost:3000", "http://127.0.0.1:3000", ...customCorsOrigins].filter((origin): origin is string => !!origin));
   const io = new Server(server, {
     path: "/api/socket/io",
     addTrailingSlash: false,
     cors: {
-      origin: "*",
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.has(origin)) callback(null, true);
+        else callback(new Error("Origin not allowed"));
+      },
       methods: ["GET", "POST"]
     }
   });
